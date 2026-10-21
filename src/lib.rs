@@ -9,6 +9,11 @@ cfg_if::cfg_if! {
                 ThreadName,
                 SuspendThreads,
                 CpuInfoFileOpen,
+                StackPointerMapping,
+                ThreadStackCopy,
+                CrashingThreadIpCopy,
+                EnumerateMappingsFromProc,
+                DebuggerRendezvousNotConsistent,
             }
         }
 
@@ -21,6 +26,10 @@ cfg_if::cfg_if! {
         mod mac;
 
         pub use mac::*;
+    } else if #[cfg(target_os = "freebsd")] {
+        mod freebsd;
+
+        pub use freebsd::*;
     }
 }
 
@@ -32,3 +41,6 @@ pub mod module_reader;
 pub mod process_reader;
 
 mod serializers;
+
+/// Re-export of crash-context
+pub use ::crash_context;

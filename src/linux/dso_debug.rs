@@ -1,7 +1,15 @@
+//! The dynamic linker's debugger rendez-vous.
+//!
+//! This holds the `<link.h>` structures the linker publishes for debuggers, and
+//! the `MD_LINUX_DSO_DEBUG` stream that is written straight from them.
+
 use {
     super::{
-        auxv::AuxvDumpInfo, minidump_writer::MinidumpWriter, process_inspection::ProcessInspector,
-        process_reader::CopyFromProcessError, serializers::*,
+        auxv::AuxvDumpInfo,
+        minidump_writer::MinidumpWriter,
+        process_inspection::ProcessInspector,
+        process_reader::{CopyFromProcessError, ProcessReader},
+        serializers::*,
     },
     crate::{
         mem_writer::{
@@ -9,29 +17,28 @@ use {
         },
         minidump_format::*,
     },
+    failspot::failspot,
+    plain::Plain,
+    std::{ffi::OsString, os::unix::ffi::OsStringExt},
 };
 
 type Result<T> = std::result::Result<T, SectionDsoDebugError>;
+type RendezvousResult<T> = std::result::Result<T, RendezvousError>;
 
-cfg_if::cfg_if! {
-    if #[cfg(target_pointer_width = "32")] {
-        use goblin::elf::program_header::program_header32::SIZEOF_PHDR;
-    } else if #[cfg(target_pointer_width = "64")] {
-        use goblin::elf::program_header::program_header64::SIZEOF_PHDR;
-    }
-}
+// Native types for internal use, while we expose the width-agnostic variants
+// for easier interaction with other code.
+#[cfg(not(target_pointer_width = "64"))]
+use goblin::elf32 as native_elf;
+#[cfg(target_pointer_width = "64")]
+use goblin::elf64 as native_elf;
 
-cfg_if::cfg_if! {
-    if #[cfg(all(target_pointer_width = "64", target_arch = "arm"))] {
-        type ElfAddr = u64;
-    } else if #[cfg(all(target_pointer_width = "64", not(target_arch = "arm")))] {
-        type ElfAddr = libc::Elf64_Addr;
-    } else if #[cfg(all(target_pointer_width = "32", target_arch = "arm"))] {
-        type ElfAddr = u32;
-    } else if #[cfg(all(target_pointer_width = "32", not(target_arch = "arm")))] {
-        type ElfAddr = libc::Elf32_Addr;
-    }
-}
+use goblin::elf::{
+    dynamic::{DT_DEBUG, DT_NULL, Dyn},
+    program_header::{PT_DYNAMIC, PT_PHDR, ProgramHeader},
+};
+
+/// Size of one dynamic section entry *in the target*.
+const SIZEOF_DYN: usize = native_elf::dynamic::SIZEOF_DYN;
 
 #[derive(Debug, thiserror::Error, serde::Serialize)]
 pub enum SectionDsoDebugError {
@@ -47,59 +54,354 @@ pub enum SectionDsoDebugError {
         #[serde(serialize_with = "serialize_from_utf8_error")]
         std::string::FromUtf8Error,
     ),
+    #[error("Failed to reach the dynamic linker's rendez-vous")]
+    Rendezvous(#[from] RendezvousError),
 }
 
-// COPY from <link.h>
+/// Errors on the way to the dynamic linker's rendez-vous.
+#[derive(Debug, thiserror::Error, serde::Serialize)]
+pub enum RendezvousError {
+    #[error("failed to read program header table")]
+    ReadProgramHeaderTableFailed(#[source] CopyFromProcessError),
+    #[error("program header table missing self-pointer")]
+    ProgramHeaderTableNoSelf,
+    #[error("program header table missing dynamic section")]
+    ProgramHeaderTableNoDynamic,
+    #[error("unexpected size for dynamic section `{0}`")]
+    InvalidDynamicSectionSize(usize),
+    #[error("dynamic section missing NULL entry")]
+    DynamicSectionMissingTerminator,
+    #[error("failed to read dynamic section")]
+    ReadDynamicSectionFailed(#[source] CopyFromProcessError),
+    #[error("failed to find DT_DEBUG entry in dynamic section")]
+    MissingDebugEntry,
+    #[error("failed to read debugger rendezvous address")]
+    ReadDebuggerRendezvousAddressFailed(#[source] CopyFromProcessError),
+    #[error("unexpected debugger rendezvous version '{0}'")]
+    UnexpectedDebuggerRendezvousVersion(i32),
+    #[error("the dynamic linker was mid-update (r_state = {0})")]
+    DebuggerRendezvousNotConsistent(i32),
+    #[error("failed reading link_map entry")]
+    ReadLinkMapEntryFailed(#[source] CopyFromProcessError),
+    #[error("failed reading the name a link_map entry points at")]
+    ReadModuleNameFailed(#[source] CopyFromProcessError),
+    #[error("invalid link entry")]
+    InvalidLinkEntry,
+}
+
+/// Main executable description, as described by its own in-memory headers
+#[derive(Debug)]
+pub(crate) struct MainExecutable {
+    /// How far the object moved from the addresses in its headers.
+    pub(crate) load_bias: usize,
+    program_headers: Vec<ProgramHeader>,
+}
+
+impl MainExecutable {
+    /// Reads the program header table the kernel advertised through `AT_PHDR`
+    /// and `AT_PHNUM`, and works out where the object owning it was loaded.
+    pub(crate) fn read(
+        memory_reader: &ProcessReader<'_>,
+        program_header_table_address: usize,
+        program_header_count: usize,
+    ) -> RendezvousResult<Self> {
+        let program_headers: Vec<ProgramHeader> = memory_reader
+            .read_pod_vec::<native_elf::program_header::ProgramHeader>(
+                program_header_table_address,
+                program_header_count,
+            )
+            .map_err(RendezvousError::ReadProgramHeaderTableFailed)?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let load_bias = Self::compute_bias(&program_headers, program_header_table_address)?;
+
+        Ok(Self {
+            load_bias,
+            program_headers,
+        })
+    }
+
+    /// `PT_PHDR` describes the program header table itself, so the difference
+    /// between the virtual address it claims and where it actually sits gives you
+    /// the load bias.
+    fn compute_bias(
+        program_headers: &[ProgramHeader],
+        program_header_table_address: usize,
+    ) -> RendezvousResult<usize> {
+        let table = program_headers
+            .iter()
+            .find(|hdr| hdr.p_type == PT_PHDR)
+            .ok_or(RendezvousError::ProgramHeaderTableNoSelf)?;
+
+        Ok(program_header_table_address - elf_addr_to_usize(table.p_vaddr))
+    }
+
+    /// Where the first segment of the given type actually is in the target, and
+    /// how big it is in memory.
+    fn find_segment(&self, segment_type: u32) -> Option<(usize, usize)> {
+        self.program_headers
+            .iter()
+            .find(|hdr| hdr.p_type == segment_type)
+            .map(|hdr| {
+                (
+                    self.load_bias + elf_addr_to_usize(hdr.p_vaddr),
+                    elf_addr_to_usize(hdr.p_memsz),
+                )
+            })
+    }
+
+    /// Copies the whole of `PT_DYNAMIC` out of the target.
+    ///
+    /// Returns the address it was read from alongside the entries.
+    pub(crate) fn dynamic_section(
+        &self,
+        memory_reader: &ProcessReader<'_>,
+    ) -> RendezvousResult<(usize, Vec<Dyn>)> {
+        let (address, size) = self
+            .find_segment(PT_DYNAMIC)
+            .ok_or(RendezvousError::ProgramHeaderTableNoDynamic)?;
+
+        // A partial trailing entry means we are not looking at a dynamic section.
+        if !size.is_multiple_of(SIZEOF_DYN) {
+            return Err(RendezvousError::InvalidDynamicSectionSize(size));
+        }
+
+        let entries: Vec<Dyn> = memory_reader
+            .read_pod_vec::<native_elf::dynamic::Dyn>(address, size / SIZEOF_DYN)
+            .map_err(RendezvousError::ReadDynamicSectionFailed)?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+
+        if entries.last() != Some(&Dyn::default()) {
+            return Err(RendezvousError::DynamicSectionMissingTerminator);
+        }
+
+        Ok((address, entries))
+    }
+
+    pub(crate) fn is_pie(&self) -> bool {
+        self.load_bias != 0
+    }
+}
+
+/// Find the DT_DEBUG debugger rendezvous within a dynamic section,
+/// typically gotten from `MainExecutable::dynamic_section`.
+pub(crate) fn find_rendezvous_address(dynamic_section: &[Dyn]) -> RendezvousResult<usize> {
+    dynamic_section
+        .iter()
+        .find_map(|entry| (entry.d_tag == DT_DEBUG).then_some(entry.d_val))
+        .map(elf_addr_to_usize)
+        .ok_or(RendezvousError::MissingDebugEntry)
+}
+
+/// How many bytes of the dynamic section actually say something: everything up
+/// to and including the `DT_NULL` terminator.
+fn dynamic_section_len(dynamic_section: &[Dyn]) -> usize {
+    let entries = dynamic_section
+        .iter()
+        .position(|entry| entry.d_tag == DT_NULL)
+        .map_or(dynamic_section.len(), |terminator| terminator + 1);
+
+    entries * SIZEOF_DYN
+}
+
+/// Convert an address read from ELF data into a native usize, panic if the target is too narrow to
+/// hold it. Assumes the ELF data comes from width-agnostic code, hence u64.
+pub(crate) fn elf_addr_to_usize(addr: impl Into<u64>) -> usize {
+    usize::try_from(addr.into()).expect("Pointer size mismatch between dumper and target")
+}
+
+/// Information for a single dynamically loaded module.
+///
+/// This structure contains important information about a dynamically-loaded
+/// module, like its name and virtual address. It is also a node in a
+/// doubly-linked list of such modules.
+///
+/// Only the leading members below are part of the protocol with the debugger —
+/// the same format used in SVR4. The linker's own fields follow them, and we
+/// never read those.
+///
+/// <https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/link.h;h=b645760402514c4839686aaeade20dd5bb7725dd;hb=HEAD#l101>
 #[derive(Debug, Clone, Default)]
 #[repr(C)]
 pub struct LinkMap {
-    /* These first few members are part of the protocol with the debugger.
-    This is the same format used in SVR4.  */
-    l_addr: ElfAddr, /* Difference between the address in the ELF
-                     file and the addresses in memory.  */
-    l_name: usize, /* Absolute file name object was found in. WAS: `char*`  */
-    l_ld: usize,   /* Dynamic section of the shared object.  WAS: `ElfW(Dyn) *` */
-    l_next: usize, /* Chain of loaded objects. WAS: `struct link_map *` */
-    l_prev: usize, /* Chain of loaded objects. WAS: `struct link_map *` */
+    /// Difference between the addresses in the ELF file and the addresses in
+    /// memory.
+    pub(crate) l_addr: usize,
+    /// Address of the absolute file name the object was found in.
+    /// WAS: `char *`
+    pub(crate) l_name: usize,
+    /// Address of the dynamic section of the shared object.
+    /// WAS: `ElfW(Dyn) *`
+    pub(crate) l_ld: usize,
+    /// Address of the next node in the chain of loaded objects.
+    /// WAS: `struct link_map *`
+    pub(crate) l_next: usize,
+    /// Address of the previous node in the chain of loaded objects.
+    /// WAS: `struct link_map *`
+    pub(crate) l_prev: usize,
 }
 
-// COPY from <link.h>
-/// This state value describes the mapping change taking place when
-/// the `r_brk' address is called.
-#[derive(Debug, Clone, Default)]
-#[allow(non_camel_case_types, unused)]
-#[repr(C)]
-enum RState {
-    /// Mapping change is complete.
-    #[default]
-    RT_CONSISTENT,
-    /// Beginning to add a new object.
-    RT_ADD,
-    /// Beginning to remove an object mapping.
-    RT_DELETE,
-}
+/// The [`RDebug::r_state`] value stating that the mapping data is reliable.
+///
+/// <https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/link.h;h=b645760402514c4839686aaeade20dd5bb7725dd;hb=HEAD#l52>
+pub(crate) const RT_CONSISTENT: libc::c_int = 0;
 
-// COPY from <link.h>
+/// Shared object loading information for the debugger.
+///
+/// The Linux dynamic linker fills this in and points the main program's
+/// `DT_DEBUG` dynamic entry at it. It is known as the "debugger rendez-vous"
+/// point and is a legacy structure to assist debuggers in locating loaded
+/// shared modules.
+///
+/// (But we're going to use it for minidump generation purposes.)
+///
+/// <https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/link.h;h=b645760402514c4839686aaeade20dd5bb7725dd;hb=HEAD#l40>
 #[derive(Debug, Clone, Default)]
 #[repr(C)]
 pub struct RDebug {
-    r_version: libc::c_int, /* Version number for this protocol.  */
-    r_map: usize,           /* Head of the chain of loaded objects. WAS: `struct link_map *` */
+    /// Version number for this protocol.
+    pub(crate) r_version: libc::c_int,
+    /// Address of the head of the chain of loaded objects.
+    /// WAS: `struct link_map *`
+    pub(crate) r_map: usize,
+    /// Address of a function internal to the run-time linker, that will always
+    /// be called when the linker begins to map in a library or unmap it, and
+    /// again when the mapping change is complete. The debugger can set a
+    /// breakpoint at this address if it wants to notice shared object mapping
+    /// changes.
+    pub(crate) r_brk: usize,
+    /// Which mapping change is taking place when `r_brk` is called: 0
+    /// (`RT_CONSISTENT`, the change is complete), 1 (`RT_ADD`, beginning to add
+    /// a new object) or 2 (`RT_DELETE`, beginning to remove an object mapping).
+    pub(crate) r_state: libc::c_int,
+    /// Base address the linker is loaded at.
+    pub(crate) r_ldbase: usize,
+}
 
-    /* This is the address of a function internal to the run-time linker,
-    that will always be called when the linker begins to map in a
-    library or unmap it, and again when the mapping change is complete.
-    The debugger can set a breakpoint at this address if it wants to
-    notice shared object mapping changes.  */
-    r_brk: ElfAddr,
-    r_state: RState,
-    r_ldbase: ElfAddr, /* Base address the linker is loaded at.  */
+// Safety: both are `repr(C)` aggregates of plain integers, so every bit pattern
+// we could read out of the target process is a valid value.
+unsafe impl Plain for LinkMap {}
+unsafe impl Plain for RDebug {}
+
+impl LinkMap {
+    /// Copies that entry's file name out of the target.
+    pub(crate) fn name(&self, reader: &ProcessReader<'_>) -> RendezvousResult<OsString> {
+        if self.l_name == 0 {
+            return Ok(OsString::new());
+        }
+
+        let mut buf = Vec::new();
+        reader
+            .read_until(self.l_name, 0, &mut buf)
+            .map_err(RendezvousError::ReadModuleNameFailed)?;
+
+        // `read_until` includes the terminator it stopped on, if it found one.
+        if buf.last() == Some(&0) {
+            buf.pop();
+        }
+
+        Ok(OsString::from_vec(buf))
+    }
+}
+
+impl RDebug {
+    pub(crate) fn from_memory(
+        address: usize,
+        reader: &ProcessReader<'_>,
+    ) -> RendezvousResult<Self> {
+        let debugger_rendezvous: RDebug = reader
+            .read_pod(address)
+            .map_err(RendezvousError::ReadDebuggerRendezvousAddressFailed)?;
+
+        if debugger_rendezvous.r_version != 1 {
+            return Err(RendezvousError::UnexpectedDebuggerRendezvousVersion(
+                debugger_rendezvous.r_version,
+            ));
+        }
+
+        if debugger_rendezvous.r_state != RT_CONSISTENT
+            || failspot!(DebuggerRendezvousNotConsistent)
+        {
+            return Err(RendezvousError::DebuggerRendezvousNotConsistent(
+                debugger_rendezvous.r_state,
+            ));
+        }
+
+        Ok(debugger_rendezvous)
+    }
+
+    pub(crate) fn map_iterator<'a>(&self, reader: &'a ProcessReader<'a>) -> LinkMapIter<'a> {
+        LinkMapIter {
+            address: self.r_map,
+            first_node: true,
+            reader,
+        }
+    }
+}
+
+/// Walks the linker's chain of loaded objects, starting at [`RDebug::r_map`].
+///
+/// Our list of DSOs potentially differs from the one in the target process, so
+/// we have to be careful never to dereference its pointers directly: every node
+/// is copied out of the target instead.
+#[derive(Debug)]
+pub(crate) struct LinkMapIter<'a> {
+    address: usize,
+    first_node: bool,
+    reader: &'a ProcessReader<'a>,
+}
+
+impl LinkMapIter<'_> {
+    fn terminate_iteration(&mut self) {
+        self.address = 0
+    }
+
+    fn is_terminated(&self) -> bool {
+        self.address == 0
+    }
+}
+
+impl<'a> Iterator for LinkMapIter<'a> {
+    type Item = RendezvousResult<LinkMap>;
+
+    /// Copies the node the walk currently sits on, and steps to `l_next`.
+    ///
+    /// Returns `None` once the chain is exhausted.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_terminated() {
+            return None;
+        }
+
+        let link = self
+            .reader
+            .read_pod::<LinkMap>(self.address)
+            .map_err(RendezvousError::ReadLinkMapEntryFailed);
+        let Ok(link) = link else {
+            self.terminate_iteration();
+            return Some(link);
+        };
+
+        if self.first_node {
+            // We were handed `r_map`, so nothing should precede us.
+            if link.l_prev != 0 {
+                self.terminate_iteration();
+                return Some(Err(RendezvousError::InvalidLinkEntry));
+            }
+            self.first_node = false;
+        }
+
+        self.address = link.l_next;
+
+        Some(Ok(link))
+    }
 }
 
 pub fn write_dso_debug_stream(
-    process_inspector: &ProcessInspector,
+    process_inspector: &dyn ProcessInspector,
     buffer: &mut Buffer,
-    blamed_thread: i32,
     auxv: &AuxvDumpInfo,
 ) -> Result<MDRawDirectory> {
     let phnum_max =
@@ -109,117 +411,22 @@ pub fn write_dso_debug_stream(
         .get_program_header_address()
         .ok_or(SectionDsoDebugError::CouldNotFind("AT_PHDR in auxv"))? as usize;
 
-    let ph = MinidumpWriter::copy_from_process(
-        process_inspector,
-        blamed_thread,
-        phdr,
-        SIZEOF_PHDR * phnum_max,
-    )?;
-    let program_headers;
-    #[cfg(target_pointer_width = "64")]
-    {
-        program_headers = goblin::elf::program_header::program_header64::ProgramHeader::from_bytes(
-            &ph, phnum_max,
-        );
-    }
-    #[cfg(target_pointer_width = "32")]
-    {
-        program_headers = goblin::elf::program_header::program_header32::ProgramHeader::from_bytes(
-            &ph, phnum_max,
-        );
-    };
+    let memory_reader = process_inspector.process_reader();
+    let main_executable = MainExecutable::read(&memory_reader, phdr, phnum_max)?;
 
-    // Assume the program base is at the beginning of the same page as the PHDR
-    let mut base = phdr & !0xfff;
-    let mut dyn_addr = 0;
-    // Search for the program PT_DYNAMIC segment
-    for ph in program_headers {
-        // Adjust base address with the virtual address of the PT_LOAD segment
-        // corresponding to offset 0
-        if ph.p_type == goblin::elf::program_header::PT_LOAD && ph.p_offset == 0 {
-            base -= ph.p_vaddr as usize;
-        }
-        if ph.p_type == goblin::elf::program_header::PT_DYNAMIC {
-            dyn_addr = ph.p_vaddr;
-        }
-    }
-
-    if dyn_addr == 0 {
-        return Err(SectionDsoDebugError::CouldNotFind(
-            "dyn_addr in program headers",
-        ));
-    }
-
-    dyn_addr += base as ElfAddr;
-
-    let dyn_size = std::mem::size_of::<goblin::elf::Dyn>();
-    let mut r_debug = 0usize;
-    let mut dynamic_length = 0usize;
-
-    // The dynamic linker makes information available that helps gdb find all
-    // DSOs loaded into the program. If this information is indeed available,
-    // dump it to a MD_LINUX_DSO_DEBUG stream.
-    loop {
-        let dyn_data = MinidumpWriter::copy_from_process(
-            process_inspector,
-            blamed_thread,
-            dyn_addr as usize + dynamic_length,
-            dyn_size,
-        )?;
-        dynamic_length += dyn_size;
-
-        // goblin::elf::Dyn doesn't have padding bytes
-        let (head, body, _tail) = unsafe { dyn_data.align_to::<goblin::elf::Dyn>() };
-        assert!(head.is_empty(), "Data was not aligned");
-        let dyn_struct = &body[0];
-
-        let debug_tag = goblin::elf::dynamic::DT_DEBUG;
-        if dyn_struct.d_tag == debug_tag {
-            r_debug = dyn_struct.d_val as usize;
-        } else if dyn_struct.d_tag == goblin::elf::dynamic::DT_NULL {
-            break;
-        }
-    }
+    let (dyn_addr, dynamic_section) = main_executable.dynamic_section(&memory_reader)?;
+    let r_debug = find_rendezvous_address(&dynamic_section)?;
 
     // The "r_map" field of that r_debug struct contains a linked list of all
     // loaded DSOs.
-    // Our list of DSOs potentially is different from the ones in the crashing
-    // process. So, we have to be careful to never dereference pointers
-    // directly. Instead, we use CopyFromProcess() everywhere.
     // See <link.h> for a more detailed discussion of the how the dynamic
     // loader communicates with debuggers.
-
-    let debug_entry_data = MinidumpWriter::copy_from_process(
-        process_inspector,
-        blamed_thread,
-        r_debug,
-        std::mem::size_of::<RDebug>(),
-    )?;
-
-    // goblin::elf::Dyn doesn't have padding bytes
-    let (head, body, _tail) = unsafe { debug_entry_data.align_to::<RDebug>() };
-    assert!(head.is_empty(), "Data was not aligned");
-    let debug_entry = &body[0];
+    let debug_entry = RDebug::from_memory(r_debug, &memory_reader)?;
 
     // Count the number of loaded DSOs
-    let mut dso_vec = Vec::new();
-    let mut curr_map = debug_entry.r_map;
-    while curr_map != 0 {
-        let link_map_data = MinidumpWriter::copy_from_process(
-            process_inspector,
-            blamed_thread,
-            curr_map,
-            std::mem::size_of::<LinkMap>(),
-        )?;
-
-        // LinkMap is repr(C) and doesn't have padding bytes, so this should be safe
-        let (head, body, _tail) = unsafe { link_map_data.align_to::<LinkMap>() };
-        assert!(head.is_empty(), "Data was not aligned");
-        let map = &body[0];
-
-        curr_map = map.l_next;
-        dso_vec.push(map.clone());
-    }
+    let dso_vec = debug_entry
+        .map_iterator(&memory_reader)
+        .collect::<RendezvousResult<Vec<_>>>()?;
 
     let mut linkmap_rva = u32::MAX;
     if !dso_vec.is_empty() {
@@ -230,25 +437,12 @@ pub fn write_dso_debug_stream(
 
         // Iterate over DSOs and write their information to mini dump
         for (idx, map) in dso_vec.iter().enumerate() {
-            let mut filename = String::new();
-            if map.l_name > 0 {
-                let filename_data = MinidumpWriter::copy_from_process(
-                    process_inspector,
-                    blamed_thread,
-                    map.l_name,
-                    256,
-                )?;
-
-                // C - string is NULL-terminated
-                if let Some(name) = filename_data.splitn(2, |x| *x == b'\0').next() {
-                    filename = String::from_utf8(name.to_vec())?;
-                }
-            }
+            let filename = String::from_utf8(map.name(&memory_reader)?.into_vec())?;
             let location = write_string_to_location(buffer, &filename)?;
             let entry = MDRawLinkMap {
-                addr: map.l_addr,
+                addr: map.l_addr as _,
                 name: location.rva,
-                ld: map.l_ld as ElfAddr,
+                ld: map.l_ld as _,
             };
 
             linkmap.set_value_at(buffer, entry, idx)?;
@@ -260,9 +454,9 @@ pub fn write_dso_debug_stream(
         version: debug_entry.r_version as u32,
         map: linkmap_rva,
         dso_count: dso_vec.len() as u32,
-        brk: debug_entry.r_brk,
-        ldbase: debug_entry.r_ldbase,
-        dynamic: dyn_addr,
+        brk: debug_entry.r_brk as _,
+        ldbase: debug_entry.r_ldbase as _,
+        dynamic: dyn_addr as _,
     };
     let debug_loc = MemoryWriter::<MDRawDebug>::alloc_with_val(buffer, debug)?;
 
@@ -271,14 +465,60 @@ pub fn write_dso_debug_stream(
         location: debug_loc.location(),
     };
 
+    // We'll want to copy *only* the dynamic section, not the entire segment.
+    let dynamic_length = dynamic_section_len(&dynamic_section);
     dirent.location.data_size += dynamic_length as u32;
-    let dso_debug_data = MinidumpWriter::copy_from_process(
-        process_inspector,
-        blamed_thread,
-        dyn_addr as usize,
-        dynamic_length,
-    )?;
+    let dso_debug_data =
+        MinidumpWriter::copy_from_process(process_inspector, dyn_addr, dynamic_length)?;
     MemoryArrayWriter::write_bytes(buffer, &dso_debug_data);
 
     Ok(dirent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use goblin::elf::program_header::PT_LOAD;
+
+    /// Create a fake PT_PHDR with the given vaddr.
+    fn program_header_table_at(virtual_address: u64) -> ProgramHeader {
+        ProgramHeader {
+            p_type: PT_PHDR,
+            p_offset: 0x40,
+            p_vaddr: virtual_address,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn load_bias_pie() {
+        let program_headers = [program_header_table_at(0x40)];
+
+        let load_bias = MainExecutable::compute_bias(&program_headers, 0xaaaa_0040).unwrap();
+
+        assert_eq!(load_bias, 0xaaaa_0000);
+    }
+
+    // No-PIE execs don't have a load bias
+    #[test]
+    fn load_bias_executable_non_pie() {
+        let program_headers = [program_header_table_at(0x40_0040)];
+
+        let load_bias = MainExecutable::compute_bias(&program_headers, 0x40_0040).unwrap();
+
+        assert_eq!(load_bias, 0);
+    }
+
+    #[test]
+    fn load_bias_no_pt_phdr() {
+        let program_headers = [ProgramHeader {
+            p_type: PT_LOAD,
+            ..Default::default()
+        }];
+
+        assert!(matches!(
+            MainExecutable::compute_bias(&program_headers, 0x40_0040),
+            Err(RendezvousError::ProgramHeaderTableNoSelf)
+        ));
+    }
 }
