@@ -6,18 +6,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
-    use {
-        super::*,
-        error_graph::ErrorList,
-        minidump_writer::{
-            LINUX_GATE_LIBRARY_NAME,
-            minidump_writer::{MinidumpWriter, MinidumpWriterConfig},
-        },
-        nix::{
-            sys::mman::{MapFlags, ProtFlags, mmap_anonymous},
-            unistd::getppid,
-        },
-    };
+    use super::*;
+    use error_graph::ErrorList;
+    use minidump_writer::Pid;
+    use minidump_writer::minidump_writer::{MinidumpWriter, MinidumpWriterConfig};
+    use minidump_writer::remote_process_inspection as remote;
+    use minidump_writer::{LINUX_GATE_LIBRARY_NAME, ProcessReaderKind};
+    use std::{ptr, thread};
 
     macro_rules! test {
         ($x:expr, $errmsg:expr) => {
@@ -36,12 +31,15 @@ mod linux {
         __result
     }});
 
+    fn getppid() -> libc::pid_t {
+        unsafe { libc::getppid() }
+    }
+
     fn test_setup() -> Result<()> {
         let ppid = getppid();
         fail_on_soft_error!(
             soft_errors,
-            MinidumpWriterConfig::new(ppid.as_raw(), ppid.as_raw())
-                .build_for_testing(&mut soft_errors)?
+            remote_mw_config(ppid, ppid).build_for_testing(&mut soft_errors)?
         );
         Ok(())
     }
@@ -50,17 +48,11 @@ mod linux {
         let ppid = getppid();
         let dumper = fail_on_soft_error!(
             soft_errors,
-            MinidumpWriterConfig::new(ppid.as_raw(), ppid.as_raw())
-                .build_for_testing(&mut soft_errors)?
+            remote_mw_config(ppid, ppid).build_for_testing(&mut soft_errors)?
         );
         test!(!dumper.threads.is_empty(), "No threads");
         test!(
-            dumper
-                .threads
-                .iter()
-                .filter(|x| x.tid == ppid.as_raw())
-                .count()
-                == 1,
+            dumper.threads.iter().filter(|x| x.tid == ppid).count() == 1,
             "Thread found multiple times"
         );
 
@@ -78,10 +70,10 @@ mod linux {
     fn test_copy_from_process(stack_var: usize, heap_var: usize) -> Result<()> {
         use minidump_writer::process_reader::ProcessReader;
 
-        let ppid = getppid().as_raw();
+        let ppid = getppid();
         let mut dumper = fail_on_soft_error!(
             soft_errors,
-            MinidumpWriterConfig::new(ppid, ppid).build_for_testing(&mut soft_errors)?
+            remote_mw_config(ppid, ppid).build_for_testing(&mut soft_errors)?
         );
 
         // We support 3 different methods of reading memory from another
@@ -90,7 +82,7 @@ mod linux {
         let expected_stack = 0x11223344usize.to_ne_bytes();
         let expected_heap = 0x55667788usize.to_ne_bytes();
 
-        let validate = |reader: &ProcessReader| -> Result<()> {
+        let validate = |reader: ProcessReader| -> Result<()> {
             let mut val = [0u8; std::mem::size_of::<usize>()];
             let read = reader.read(stack_var, &mut val)?;
             assert_eq!(read, val.len());
@@ -105,7 +97,10 @@ mod linux {
 
         // virtual mem
         {
-            dumper.process_inspector.force_pr_virtual_mem();
+            dumper
+                .process_inspector
+                .force_process_reader_kind(ProcessReaderKind::VirtualMem)
+                .unwrap();
             validate(dumper.process_inspector.process_reader())
                 .map_err(|err| format!("failed to validate memory: {err}"))?;
         }
@@ -114,24 +109,29 @@ mod linux {
         {
             dumper
                 .process_inspector
-                .force_pr_file()
-                .map_err(|err| format!("failed to open `/proc/{ppid}/mem`: {err}"))?;
+                .force_process_reader_kind(ProcessReaderKind::File)
+                .unwrap();
             validate(dumper.process_inspector.process_reader())
                 .map_err(|err| format!("failed to validate memory: {err}"))?;
         }
 
         // ptrace
         {
-            dumper.process_inspector.force_pr_ptrace();
+            dumper
+                .process_inspector
+                .force_process_reader_kind(ProcessReaderKind::Ptrace)
+                .unwrap();
             validate(dumper.process_inspector.process_reader())
                 .map_err(|err| format!("failed to validate memory: {err}"))?;
         }
 
-        dumper.process_inspector.force_pr_reset();
+        dumper
+            .process_inspector
+            .force_process_reader_kind(ProcessReaderKind::Unspecified)
+            .unwrap();
 
         let stack_res = MinidumpWriter::copy_from_process(
-            &dumper.process_inspector,
-            ppid,
+            dumper.process_inspector.as_ref(),
             stack_var,
             std::mem::size_of::<usize>(),
         )?;
@@ -139,8 +139,7 @@ mod linux {
         test!(stack_res == expected_stack, "stack var not correct");
 
         let heap_res = MinidumpWriter::copy_from_process(
-            &dumper.process_inspector,
-            ppid,
+            dumper.process_inspector.as_ref(),
             heap_var,
             std::mem::size_of::<usize>(),
         )?;
@@ -157,8 +156,7 @@ mod linux {
 
         let dumper = fail_on_soft_error!(
             soft_errors,
-            MinidumpWriterConfig::new(ppid.as_raw(), ppid.as_raw())
-                .build_for_testing(&mut soft_errors)?
+            remote_mw_config(ppid, ppid).build_for_testing(&mut soft_errors)?
         );
         dumper
             .find_mapping(addr1)
@@ -173,24 +171,21 @@ mod linux {
     }
 
     fn test_file_id() -> Result<()> {
-        let ppid = getppid().as_raw();
+        let ppid = getppid();
         let exe_link = format!("/proc/{ppid}/exe");
         let exe_name = std::fs::read_link(exe_link)?.into_os_string();
 
-        let mut dumper = fail_on_soft_error!(
+        let dumper = fail_on_soft_error!(
             soft_errors,
-            MinidumpWriterConfig::new(ppid, ppid).build_for_testing(&mut soft_errors)?
+            remote_mw_config(ppid, ppid).build_for_testing(&mut soft_errors)?
         );
 
-        let mut found_exe = None;
-        for (idx, mapping) in dumper.mappings.iter().enumerate() {
-            if mapping.name.as_ref().map(|x| x.into()).as_ref() == Some(&exe_name) {
-                found_exe = Some(idx);
-                break;
-            }
-        }
-        let idx = found_exe.unwrap();
-        let id = dumper.build_id_from_process_memory_for_index(idx)?;
+        let exe_mapping = dumper
+            .mappings
+            .iter()
+            .find(|mapping| mapping.name.as_ref().map(|x| x.into()).as_ref() == Some(&exe_name))
+            .unwrap();
+        let id = dumper.build_id_from_process_memory(exe_mapping.start_address)?;
 
         drop(dumper);
 
@@ -203,8 +198,7 @@ mod linux {
         // Now check that PtraceDumper interpreted the mappings properly.
         let dumper = fail_on_soft_error!(
             soft_errors,
-            MinidumpWriterConfig::new(getppid().as_raw(), getppid().as_raw())
-                .build_for_testing(&mut soft_errors)?
+            remote_mw_config(getppid(), getppid()).build_for_testing(&mut soft_errors)?
         );
         let mut mapping_count = 0;
         for map in &dumper.mappings {
@@ -226,33 +220,28 @@ mod linux {
     }
 
     fn test_linux_gate_mapping_id() -> Result<()> {
-        let ppid = getppid().as_raw();
-        let mut dumper = fail_on_soft_error!(
+        let ppid = getppid();
+        let dumper = fail_on_soft_error!(
             soft_errors,
-            MinidumpWriterConfig::new(ppid, ppid).build_for_testing(&mut soft_errors)?
+            remote_mw_config(ppid, ppid).build_for_testing(&mut soft_errors)?
         );
-        let mut found_linux_gate = false;
-        for idx in 0..dumper.mappings.len() {
-            if dumper.mappings[idx].name == Some(LINUX_GATE_LIBRARY_NAME.into()) {
-                found_linux_gate = true;
+        let linux_gate = dumper
+            .mappings
+            .iter()
+            .find(|mapping| mapping.name == Some(LINUX_GATE_LIBRARY_NAME.into()));
+        test!(linux_gate.is_some(), "found no linux_gate");
 
-                let id = dumper.build_id_from_process_memory_for_index(idx)?;
-
-                test!(!id.is_empty(), "id-vec is empty");
-                test!(id.iter().any(|&x| x > 0), "all id elements are 0");
-                drop(dumper);
-                break;
-            }
-        }
-        test!(found_linux_gate, "found no linux_gate");
+        let id = dumper.build_id_from_process_memory(linux_gate.unwrap().start_address)?;
+        test!(!id.is_empty(), "id-vec is empty");
+        test!(id.iter().any(|&x| x > 0), "all id elements are 0");
         Ok(())
     }
 
     fn test_mappings_include_linux_gate() -> Result<()> {
-        let ppid = getppid().as_raw();
+        let ppid = getppid();
         let dumper = fail_on_soft_error!(
             soft_errors,
-            MinidumpWriterConfig::new(ppid, ppid).build_for_testing(&mut soft_errors)?
+            remote_mw_config(ppid, ppid).build_for_testing(&mut soft_errors)?
         );
         let linux_gate_loc = dumper.auxv.get_linux_gate_address().unwrap();
         test!(linux_gate_loc != 0, "linux_gate_loc == 0");
@@ -315,29 +304,86 @@ mod linux {
         }
     }
 
+    /// If MADV_GUARD_INSTALL fails, backup method to use to install
+    /// test guard pages.
+    enum BackupGuard {
+        Unmap,
+        MProtect,
+    }
+
+    /// Maps 4 pages filled with 0xab, with an unreadable guard page in the
+    /// third one, and prints the mapping address, mapping length, top of
+    /// stack, stack size, guard page address and page size.
+    fn spawn_guarded_mmap_wait(backup_guard: BackupGuard) -> Result<()> {
+        // Not in the libc crate yet.
+        const MADV_GUARD_INSTALL: libc::c_int = 102;
+
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = 4 * page_size;
+        let mapping = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        test!(mapping != libc::MAP_FAILED, "mmap failed");
+        unsafe { ptr::write_bytes(mapping.cast::<u8>(), 0xab, len) };
+
+        let guard = unsafe { mapping.add(2 * page_size) };
+        let top_of_stack = unsafe { mapping.add(3 * page_size) };
+        let stack_size = page_size;
+        let rc = unsafe { libc::madvise(guard, page_size, MADV_GUARD_INSTALL) };
+        if rc != 0 {
+            let rc = match backup_guard {
+                BackupGuard::Unmap => unsafe { libc::munmap(guard, page_size) },
+                BackupGuard::MProtect => unsafe {
+                    libc::mprotect(guard, page_size, libc::PROT_NONE)
+                },
+            };
+            test!(rc == 0, "couldn't install the guard page");
+        }
+
+        println!(
+            "{} {} {} {} {} {page_size}",
+            mapping as usize, len, top_of_stack as usize, stack_size, guard as usize,
+        );
+        loop {
+            thread::park();
+        }
+    }
+
     fn spawn_mmap_wait() -> Result<()> {
-        let page_size = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).unwrap();
-        let memory_size = std::num::NonZeroUsize::new(page_size.unwrap() as usize).unwrap();
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page_size > 0);
+        let memory_size = std::num::NonZeroUsize::new(page_size as usize).unwrap();
         // Get some memory to be mapped by the child-process
         let mapped_mem = unsafe {
-            mmap_anonymous(
-                None,
-                memory_size,
-                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
-            )
-            .unwrap()
+            let ptr = libc::mmap(
+                ptr::null_mut(),
+                memory_size.into(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert!(ptr != libc::MAP_FAILED);
+            ptr
         };
-
-        println!("{} {}", mapped_mem.as_ptr() as usize, memory_size);
+        println!("{} {}", mapped_mem as usize, memory_size);
         loop {
             std::thread::park();
         }
     }
 
     fn spawn_alloc_wait() -> Result<()> {
-        let page_size = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).unwrap();
-        let memory_size = page_size.unwrap() as usize;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page_size > 0);
+
+        let memory_size = page_size as usize;
 
         let mut values = Vec::<u8>::with_capacity(memory_size);
         for idx in 0..memory_size {
@@ -403,6 +449,8 @@ mod linux {
                 "mappings_include_linux_gate" => test_mappings_include_linux_gate(),
                 "linux_gate_mapping_id" => test_linux_gate_mapping_id(),
                 "spawn_mmap_wait" => spawn_mmap_wait(),
+                "spawn_guarded_mmap_wait" => spawn_guarded_mmap_wait(BackupGuard::Unmap),
+                "spawn_guarded_stack_wait" => spawn_guarded_mmap_wait(BackupGuard::MProtect),
                 "spawn_alloc_wait" => spawn_alloc_wait(),
                 _ => Err("Len 1: Unknown test option".into()),
             },
@@ -444,6 +492,233 @@ mod linux {
                     Err(format!("Len 4: Unknown test option: {}", args[0]).into())
                 }
             }
+            _ => Err("Unknown test option".into()),
+        }
+    }
+
+    fn remote_mw_config(process_id: Pid, blamed_thread: Pid) -> MinidumpWriterConfig {
+        let mut config = MinidumpWriterConfig::new(process_id, blamed_thread);
+        config.set_remote_transport(TransportForTestExecutor::new(process_id));
+        config
+    }
+
+    #[derive(Debug)]
+    struct TransportForTestExecutor {
+        transport: Option<remote::transport::postcard::Backend<remote::io::UnixStream, Vec<u8>>>,
+        thread_handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TransportForTestExecutor {
+        pub fn new(pid: Pid) -> Self {
+            let (backend_io, executor_io) =
+                remote::io::UnixStream::pair().expect("failed to create unix stream");
+
+            let thread_handle = thread::spawn(move || {
+                let args_buf = vec![0u8; remote::ARGS_BUFFER_LEN];
+                let transport = remote::transport::postcard::Executor::new(executor_io, args_buf);
+                let mut executor_resources = remote::ExecutorResources::const_new();
+                remote::executor::run(pid, transport, executor_resources.as_mut())
+                    .expect("an error occurred running the executor");
+            });
+
+            let output_buf = vec![0u8; remote::OUTPUT_BUFFER_LEN];
+            let transport = remote::transport::postcard::Backend::new(backend_io, output_buf);
+
+            TransportForTestExecutor {
+                transport: Some(transport),
+                thread_handle: Some(thread_handle),
+            }
+        }
+    }
+
+    impl Drop for TransportForTestExecutor {
+        fn drop(&mut self) {
+            drop(self.transport.take().unwrap());
+            if let Err(payload) = self.thread_handle.take().unwrap().join()
+                && !thread::panicking()
+            {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    impl remote::transport::Backend for TransportForTestExecutor {
+        fn max_response_output_len(&self) -> usize {
+            self.transport.as_ref().unwrap().max_response_output_len()
+        }
+
+        fn send_request<'output, Req: serde::Serialize, Resp: serde::Deserialize<'output>>(
+            &'output mut self,
+            req: Req,
+        ) -> std::result::Result<Resp, remote::transport::BackendError> {
+            self.transport.as_mut().unwrap().send_request(req)
+        }
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+mod freebsd {
+    use super::*;
+
+    /// Signals readiness on stdout and parks forever.
+    fn wait_forever() -> ! {
+        println!("1");
+        loop {
+            std::thread::park();
+        }
+    }
+
+    fn spawn_and_wait(num: usize) -> Result<()> {
+        // One less than the requested amount, as the main thread counts as well
+        for _ in 1..num {
+            std::thread::spawn(|| {
+                println!("1");
+                loop {
+                    std::thread::park();
+                }
+            });
+        }
+        println!("1");
+        loop {
+            std::thread::park();
+        }
+    }
+
+    fn spawn_name_wait(num: usize) -> Result<()> {
+        for id in 1..num {
+            std::thread::Builder::new()
+                .name(format!("thread_{id}"))
+                .spawn(move || {
+                    let cname = std::ffi::CString::new(format!("thread_{id}"))
+                        .expect("thread name contained null");
+                    // SAFETY: pthread_set_name_np takes a valid pthread_t from
+                    // pthread_self() and a valid null-terminated C string from
+                    // CString which lives for the duration of the call.
+                    unsafe {
+                        libc::pthread_set_name_np(libc::pthread_self(), cname.as_ptr());
+                    }
+                    wait_forever();
+                })?;
+        }
+        println!("1");
+        loop {
+            std::thread::park();
+        }
+    }
+
+    fn spawn_mmap_wait() -> Result<()> {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let mapped_mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if mapped_mem == libc::MAP_FAILED {
+            return Err("mmap failed".into());
+        }
+
+        println!("{} {}", mapped_mem as usize, page_size);
+        wait_forever()
+    }
+
+    /// Spawns a grandchild running `spawn_and_wait` and prints its pid.
+    fn spawn_spawn_wait() -> Result<()> {
+        let exe = std::env::current_exe()?;
+        let mut grandchild = std::process::Command::new(exe)
+            .arg("spawn_and_wait")
+            .arg("1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let pid = grandchild.id();
+        println!("{pid}");
+        grandchild.wait()?;
+        Ok(())
+    }
+
+    fn spawn_alloc_wait() -> Result<()> {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+
+        let mut values = Vec::<u8>::with_capacity(page_size);
+        for idx in 0..page_size {
+            values.push((idx % 255) as u8);
+        }
+
+        println!("{:p} {}", values.as_ptr(), page_size);
+        wait_forever()
+    }
+
+    fn create_files_wait(num: usize) -> Result<()> {
+        use std::{fmt::Write, io::Read};
+
+        let mut file_array = Vec::<std::fs::File>::with_capacity(num);
+
+        let mut rand = std::fs::File::open("/dev/urandom").expect("failed to open /dev/urandom");
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+        let mut root = std::env::temp_dir();
+        root.push("minidump-writer");
+
+        if !root.exists() {
+            std::fs::create_dir_all(&root).expect("failed to create $TMP/minidump-writer dir");
+        }
+
+        let mut rand_indices = [0u8; 6];
+
+        for id in 0..num {
+            let mut name = String::new();
+            name.push_str("test_file");
+
+            rand.read_exact(&mut rand_indices)
+                .expect("failed to read /dev/urandom");
+
+            for index in rand_indices {
+                name.push(CHARS[index as usize % CHARS.len()] as char);
+            }
+
+            write!(&mut name, "{id}").unwrap();
+
+            let path = root.join(name);
+            file_array.push(std::fs::File::create(&path).expect("failed to create path"));
+            println!("1");
+        }
+        // Keep the files open (and referenced) until the dump is taken.
+        println!("1");
+        loop {
+            std::thread::park();
+            println!("{}", file_array.len());
+        }
+    }
+
+    pub(super) fn real_main(args: Vec<String>) -> Result<()> {
+        match args.len() {
+            1 => match args[0].as_ref() {
+                "nop" => Ok(()),
+                "setup" => Ok(()),
+                "spawn_mmap_wait" => spawn_mmap_wait(),
+                "spawn_alloc_wait" => spawn_alloc_wait(),
+                "spawn_spawn_wait" => spawn_spawn_wait(),
+                _ => Err("Len 1: Unknown test option".into()),
+            },
+            2 => match args[0].as_ref() {
+                "spawn_and_wait" => {
+                    let num_of_threads: usize = args[1].parse().unwrap();
+                    spawn_and_wait(num_of_threads)
+                }
+                "spawn_name_wait" => {
+                    let num_of_threads: usize = args[1].parse().unwrap();
+                    spawn_name_wait(num_of_threads)
+                }
+                "create_files_wait" => {
+                    let num_of_files: usize = args[1].parse().unwrap();
+                    create_files_wait(num_of_files)
+                }
+                _ => Err(format!("Len 2: Unknown test option: {}", args[0]).into()),
+            },
             _ => Err("Unknown test option".into()),
         }
     }
@@ -504,7 +779,7 @@ mod mac {
 
     #[inline(never)]
     pub(super) fn real_main(args: Vec<String>) -> Result<()> {
-        let port_name = args.get(0).ok_or("mach port name not specified")?;
+        let port_name = args.first().ok_or("mach port name not specified")?;
         let exception: u32 = args.get(1).ok_or("exception code not specified")?.parse()?;
 
         let client =
@@ -561,11 +836,14 @@ fn main() -> Result<()> {
     cfg_if::cfg_if! {
         if #[cfg(any(target_os = "linux", target_os = "android"))] {
             linux::real_main(args)
+        } else if #[cfg(target_os = "freebsd")] {
+            freebsd::real_main(args)
         } else if #[cfg(target_os = "windows")] {
             windows::real_main(args)
         } else if #[cfg(target_os = "macos")] {
             mac::real_main(args)
         } else {
+            let _ = args;
             unimplemented!();
         }
     }

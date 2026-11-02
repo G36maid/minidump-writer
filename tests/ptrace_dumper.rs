@@ -1,21 +1,14 @@
 //! All of these tests are specific to ptrace
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
-use {
-    common::*,
-    error_graph::ErrorList,
-    minidump_writer::minidump_writer::MinidumpWriterConfig,
-    nix::{
-        sys::mman::{MapFlags, ProtFlags, mmap},
-        sys::signal::Signal,
-    },
-    std::{
-        convert::TryInto,
-        io::{BufRead, BufReader},
-        mem::size_of,
-        os::unix::process::ExitStatusExt,
-    },
-};
+use common::*;
+use error_graph::ErrorList;
+use std::convert::TryInto;
+use std::ffi::c_void;
+use std::io::{BufRead, BufReader};
+use std::mem::size_of;
+use std::os::unix::process::ExitStatusExt;
+use std::ptr;
 
 mod common;
 
@@ -108,7 +101,7 @@ fn thread_list_from_parent() {
 
     let dumper = assert_no_soft_errors!(
         soft_errors,
-        MinidumpWriterConfig::new(pid, pid).build_for_testing(&mut soft_errors)
+        remote_mw_config(pid, pid).build_for_testing(&mut soft_errors)
     )
     .expect("Couldn't init dumper");
 
@@ -118,7 +111,7 @@ fn thread_list_from_parent() {
     for (idx, curr_thread) in dumper.threads.iter().enumerate() {
         println!("curr_thread: {curr_thread:?}");
         let info = dumper
-            .get_thread_info_by_index(idx)
+            .get_thread_info_by_index(idx, error_graph::strategy::DontCare)
             .expect("Could not get thread info by index");
         let (_valid_stack_ptr, stack_len) = dumper
             .get_stack_info(info.stack_pointer)
@@ -165,7 +158,7 @@ fn thread_list_from_parent() {
     let waitres = child.wait().expect("Failed to wait for child");
     let status = waitres.signal().expect("Child did not die due to signal");
     assert_eq!(waitres.code(), None);
-    assert_eq!(status, Signal::SIGKILL as i32);
+    assert_eq!(status, libc::SIGKILL);
 
     // We clean up the child process before checking the final result
     // TODO: I currently know of no way to write the thread_id into the registers using Rust,
@@ -188,9 +181,10 @@ fn linux_gate_mapping_id() {
 
 #[test]
 fn merges_mappings() {
-    let page_size = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).unwrap();
-    let page_size = std::num::NonZeroUsize::new(page_size.unwrap() as usize).unwrap();
-    let map_size = std::num::NonZeroUsize::new(3 * page_size.get()).unwrap();
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(page_size > 0);
+    let page_size = usize::try_from(page_size).unwrap();
+    let map_size = 3 * page_size;
 
     let path: String = if let Ok(p) = std::env::var("TEST_HELPER") {
         p
@@ -202,30 +196,31 @@ fn merges_mappings() {
     // mmap two segments out of the helper binary, one
     // enclosed in the other, but with different protections.
     let mapped_mem = unsafe {
-        mmap(
-            None,
+        let ptr = libc::mmap(
+            ptr::null_mut(),
             map_size,
-            ProtFlags::PROT_READ,
-            MapFlags::MAP_SHARED,
-            &file,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            std::os::fd::AsRawFd::as_raw_fd(&file),
             0,
-        )
-        .unwrap()
+        );
+        assert!(ptr != libc::MAP_FAILED);
+        ptr
     };
 
-    let mapped = mapped_mem.as_ptr() as usize;
+    let mapped = mapped_mem as usize;
 
     // Carve a page out of the first mapping with different permissions.
     let _inside_mapping = unsafe {
-        mmap(
-            std::num::NonZeroUsize::new(mapped + 2 * page_size.get()),
+        libc::mmap(
+            (mapped + 2 * page_size) as *mut c_void,
             page_size,
-            ProtFlags::PROT_NONE,
-            MapFlags::MAP_SHARED | MapFlags::MAP_FIXED,
-            &file,
+            libc::PROT_NONE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            std::os::fd::AsRawFd::as_raw_fd(&file),
             // Map a different offset just to
             // better test real-world conditions.
-            page_size.get().try_into().unwrap(), // try_into() in order to work for 32 and 64 bit
+            page_size.try_into().unwrap(),
         )
     };
 
@@ -287,13 +282,13 @@ fn sanitizes_stack_copies() {
 
     let dumper = assert_no_soft_errors!(
         soft_errors,
-        MinidumpWriterConfig::new(pid, pid).build_for_testing(&mut soft_errors)
+        remote_mw_config(pid, pid).build_for_testing(&mut soft_errors)
     )
     .expect("Couldn't init dumper");
     assert_eq!(dumper.threads.len(), num_of_threads);
 
     let thread_info = dumper
-        .get_thread_info_by_index(0)
+        .get_thread_info_by_index(0, error_graph::strategy::DontCare)
         .expect("Couldn't find thread_info");
 
     let defaced;
@@ -338,7 +333,7 @@ fn sanitizes_stack_copies() {
     // The instruction pointer definitely should point into an executable mapping.
     let instr_ptr = thread_info.get_instruction_pointer();
     let mapping_info = dumper
-        .find_mapping_no_bias(instr_ptr)
+        .find_mapping(instr_ptr)
         .expect("Failed to find mapping info");
     assert!(mapping_info.is_executable());
 
@@ -392,5 +387,71 @@ fn sanitizes_stack_copies() {
     let waitres = child.wait().expect("Failed to wait for child");
     let status = waitres.signal().expect("Child did not die due to signal");
     assert_eq!(waitres.code(), None);
-    assert_eq!(status, Signal::SIGKILL as i32);
+    assert_eq!(status, libc::SIGKILL);
+}
+
+// Ensures that reads stop right at a guard page, whichever way the memory is read
+#[test]
+fn reads_until_guard_page() {
+    use minidump_writer::{ProcessReaderKind, minidump_writer::MinidumpWriter};
+
+    let mut child = start_child_and_return(&["spawn_guarded_mmap_wait"]);
+    let pid = child.id() as i32;
+
+    let mut line = String::new();
+    BufReader::new(child.stdout.as_mut().expect("Can't open stdout"))
+        .read_line(&mut line)
+        .expect("Couldn't read address provided by child");
+    let [mapping, map_len, .., guard, page_size]: [usize; 6] = line
+        .split_whitespace()
+        .map(|x| x.parse().unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
+    let mut dumper = assert_no_soft_errors!(
+        soft_errors,
+        remote_mw_config(pid, pid).build_for_testing(&mut soft_errors)
+    )
+    .expect("Couldn't init dumper");
+
+    for kind in [
+        ProcessReaderKind::VirtualMem,
+        ProcessReaderKind::File,
+        ProcessReaderKind::Ptrace,
+    ] {
+        let name = format!("{kind:?}");
+        dumper
+            .process_inspector
+            .force_process_reader_kind(kind)
+            .unwrap();
+
+        // Start in the middle of a page, to check that the reads stop at the
+        // guard page rather than at some multiple of the page size.
+        let src = mapping + 100;
+        let data = MinidumpWriter::read_until_guard(
+            dumper.process_inspector.as_ref(),
+            page_size,
+            src,
+            map_len - 100,
+        )
+        .unwrap_or_else(|e| panic!("{name}: read failed: {e}"));
+        assert_eq!(data.len(), guard - src, "{name}");
+        assert!(data.iter().all(|&b| b == 0xab), "{name}");
+
+        assert!(
+            MinidumpWriter::read_until_guard(
+                dumper.process_inspector.as_ref(),
+                page_size,
+                guard,
+                page_size
+            )
+            .is_err(),
+            "{name}: read starting at the guard page succeeded"
+        );
+    }
+
+    drop(dumper);
+    child.kill().expect("Failed to kill process");
+    child.wait().expect("Failed to wait for child");
 }
