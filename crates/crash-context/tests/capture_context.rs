@@ -41,6 +41,19 @@ fn captures() {
                 assert!(gregs[libc::REG_RBP as usize] != 0);
                 assert!(gregs[libc::REG_RSP as usize] != 0);
                 assert!(gregs[libc::REG_RIP as usize] != 0);
+            } else if #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))] {
+                let ctx = crash_context::CrashContext::capture().expect("getcontext");
+                let mc = &ctx.context.uc_mcontext;
+                assert!(mc.mc_rbp != 0);
+                assert!(mc.mc_rsp != 0);
+                assert!(mc.mc_rip != 0);
+                assert_eq!(ctx.pid, std::process::id() as i32);
+
+                // Round-trip through bytes.
+                let bytes = ctx.as_bytes();
+                let restored = crash_context::CrashContext::from_bytes(bytes)
+                    .expect("round-trip");
+                assert_eq!(restored.context.uc_mcontext.mc_rip, mc.mc_rip);
             }
         }
     }
